@@ -173,16 +173,51 @@ def detect_receipt(image):
             'source':'hybrid_v5_'+reason,'candidate_count':len(evaluated),
             'top_candidates':top,'top_correction':reason}
 
+def make_ocr_safe_corners(corners, image_shape, correction_reason):
+    """Keep detection corners intact; expand OCR crop toward top image boundary
+    only when the automatic top-edge correction was used and a slanted
+    near-top edge could cut off merchant text. No GT or image-specific names.
+    """
+    points = order_points(corners).copy()
+    height, width = image_shape[:2]
+    top_y = points[:2, 1]
+    if correction_reason != 'corrected':
+        return points
+    # A corrected top edge near the image boundary, with substantial slope.
+    if not (np.min(top_y) < 0.05 * height and
+            np.max(top_y) < 0.16 * height and
+            np.max(top_y) - np.min(top_y) > 0.04 * height):
+        return points
+    for top_index, bottom_index in ((0, 3), (1, 2)):
+        top = points[top_index]
+        bottom = points[bottom_index]
+        dy = float(bottom[1] - top[1])
+        if dy <= 1.0:
+            continue
+        # Extrapolate each side to the upper image boundary, without
+        # synthesizing pixels beyond the original photograph.
+        factor = float(top[1]) / dy
+        extended = top + factor * (top - bottom)
+        if 0 <= extended[0] < width:
+            points[top_index] = extended
+    if valid_quad(points, width, height):
+        return points
+    return order_points(corners)
+
+
 def preprocess_receipt(image_input,method='clahe_gaussian_b21_c10'):
     try:
         image=read_image(image_input) if isinstance(image_input,(str,Path)) else image_input.copy()
         if image.ndim!=3 or image.shape[2]!=3:raise ValueError('BGR 이미지 필요')
         result=detect_receipt(image)
         if not result['success']:raise ValueError(result['error'])
-        corners=result['corners'];warped=warp_receipt(image,corners)
+        corners=result['corners']
+        ocr_corners=make_ocr_safe_corners(corners,image.shape,result['top_correction'])
+        warped=warp_receipt(image,ocr_corners)
         variants=make_ocr_variants(warped)
         if method not in variants:raise ValueError('지원하지 않는 OCR 전처리: '+method)
         return {'success':True,'error':None,'corners':corners.tolist(),
+                'ocr_corners':ocr_corners.tolist(),
                 'detection_score':result['score'],'detection_source':result['source'],
                 'candidate_count':result['candidate_count'],'top_candidates':result['top_candidates'],
                 'warped':warped,'ocr_image':variants[method],'variants':variants,
@@ -190,6 +225,6 @@ def preprocess_receipt(image_input,method='clahe_gaussian_b21_c10'):
                 'top_correction':result['top_correction']}
     except (ValueError,TypeError,OSError,cv2.error) as exc:
         return {'success':False,'error':str(exc),'corners':None,'detection_score':None,
-                'detection_source':None,'candidate_count':0,'top_candidates':[],
+                'detection_source':None,'ocr_corners':None,'candidate_count':0,'top_candidates':[],
                 'warped':None,'ocr_image':None,'variants':{},'detection_overlay':None,
                 'method':method,'top_correction':None}
