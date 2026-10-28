@@ -218,3 +218,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Python environment
+.venv/
+__pycache__/
+
+# Generated preprocessing outputs
+outputs/
