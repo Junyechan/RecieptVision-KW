@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from datetime import date
 from typing import Any, Iterable
 
 
@@ -37,7 +38,9 @@ def _normalize_date(
     if two_digit_year:
         year += 2000 if year < 70 else 1900
 
-    if not (1 <= month <= 12 and 1 <= day <= 31):
+    try:
+        date(year, month, day)
+    except ValueError:
         return ""
 
     return f"{year:04d}-{month:02d}-{day:02d}"
