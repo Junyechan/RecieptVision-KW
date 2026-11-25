@@ -226,7 +226,7 @@ def extract_receipt_info(
 
     lines = [line.strip() for line in lines if line and line.strip()]
 
-    date = extract_date(raw_text)
+    date = extract_date(raw_text) if raw_text.strip() else extract_date("\n".join(lines))
     total = extract_total(lines)
     items = extract_items(lines, total=total)
 
