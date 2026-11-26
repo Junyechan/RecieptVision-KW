@@ -6,7 +6,7 @@ import csv
 from preprocessing import preprocess_receipt, save_image
 
 BASE=Path(__file__).resolve().parent
-NAMES=['receipt_01.jpg','receipt_02.jpg','receipt_03.jpg','receipt_04.jpg','receipt_05.jpg','sample_receipt.jpg']
+NAMES=['receipt_01.png','receipt_02.png','receipt_03.png','receipt_04.png','receipt_05.png','sample_receipt.png']
 OUT=BASE/'outputs'/'pipeline_v5_1'
 
 def main():

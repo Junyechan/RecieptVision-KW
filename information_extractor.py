@@ -1,381 +1,582 @@
-"""Receipt field extraction for Korean/English EasyOCR output."""
+"""Receipt field extraction for Korean/English EasyOCR results.
+
+The extractor uses OCR text plus relative Bounding Box geometry.  It deliberately
+avoids receipt-specific pixel coordinates and product-name lookup tables.
+"""
 from __future__ import annotations
+
 import re
-from collections import Counter
+import unicodedata
 from datetime import date
 from typing import Any, Iterable
 
+# ---------------------------------------------------------------------------
+# Text normalization and primitive parsers
+# ---------------------------------------------------------------------------
 DATE_PATTERNS = (
     re.compile(r"(?<!\d)(20\d{2})\s*[./년-]\s*(\d{1,2})\s*[./월-]\s*(\d{1,2})\s*일?(?!\d)"),
     re.compile(r"(?<!\d)(\d{2})\s*[./-]\s*(\d{1,2})\s*[./-]\s*(\d{1,2})(?!\d)"),
 )
+
+# Labels are compacted before matching so OCR-inserted spaces are tolerated.
 TOTAL_LABELS = (
-    re.compile(r"정\s*상"),
-    re.compile(r"총\s*합\s*계|합\s*계|총\s*액"),
-    re.compile(r"총\s*결\s*제|받을\s*금\s*액|결\s*제\s*금\s*액"),
-    re.compile(r"grand\s*total|amount\s*due|total", re.I),
+    "결제금액", "받을금액", "총결제", "총합계", "합계", "총액", "청구금액",
+    "grandtotal", "amountdue", "total",
 )
-SUBTOTAL_RE = re.compile(r"소\s*계|subtotal", re.I)
-IGNORE_LINE_RE = re.compile(
-    r"부\s*가\s*세|과\s*세\s*금\s*액|vat|\btax\b|할\s*인|discount|거스름돈|받은\s*금액|"
-    r"현금|카드|승인|전화|\btel\b|사업자|카드번호|승인번호|상품권|기프트|gift|refund|"
-    r"교환|반품|주소|서울특별시|서울시|매출전표|신용카드|전자서명|매입사|발급사|결제정보|고객용|환불|바코드",
+TAX_LABELS = ("과세금액", "과세", "supplyamount", "taxableamount")
+VAT_LABELS = ("부가세", "vat", "taxamount")
+SLIP_MARKERS = ("신용카드매출전표", "카드매출전표", "creditcardsalesslip")
+
+# These are semantic exclusions, not coordinate rules.
+NON_ITEM_RE = re.compile(
+    r"사업자|등록번호|전화|연락처|주소|서울특별시|서울시|도로명|우편번호|"
+    r"카드번호|승인번호|승인|매입사|발급사|결제정보|전자서명|매출전표|"
+    r"고객용|현금|카드|거스름돈|받은금액|과세금액|부가세|부가\s*세|"
+    r"환불|교환|반품|환물|구입|가능기간|가격택|착용|패키지|개봉|"
+    r"상품코드|품목코드|바코드|사업자정보|상품권|gift\s*voucher|결제금액|총액|합계|subtotal|"
+    r"grand\s*total|amount\s*due|tax|vat|discount|refund|change|cash|credit\s*card",
     re.I,
 )
-NUM = r"[0-9OoCcGgRr][0-9OoCcGgRr,;]*(?:\.[0-9]{1,2})?"
-MONEY_RE = re.compile(rf"(?<![A-Za-z0-9])(?:₩\s*)?({NUM})(?:\s*원)?(?![A-Za-z0-9])", re.I)
-ITEM_NUMBER_RE = re.compile(r"^\s*(\d{1,2})\s*[.)、:-]?\s+(.+?)\s*$")
-QTY_PRICE_RE = re.compile(rf"(?<!\d)([1-9]\d?)\s+({NUM})\s*$", re.I)
+
+# Korean/English receipt OCR frequently confuses O with 0 and ; with comma.
+_DIGIT_TRANSLATION = str.maketrans({
+    "O": "0", "o": "0", "D": "0", "Q": "0",
+    "I": "1", "l": "1", "|": "1",
+    "S": "5", "s": "5", "B": "8", "g": "9", "C": "0", "c": "0", "r": "0",
+    ";": ",", "，": ",", "．": ".",
+})
+_MONEY_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:₩\s*)?([0-9OoDQiIl|SsBgCcr;，,]{1,14})(?:\s*원)?(?![A-Za-z0-9])",
+    re.I,
+)
 
 
-def _compact(s: str) -> str:
-    return re.sub(r"\s+", "", s or "")
+def _compact(text: str) -> str:
+    return re.sub(r"[\s\W_]+", "", unicodedata.normalize("NFKC", text or "")).lower()
 
 
-def _normalize_date(m: re.Match[str], short_year: bool = False) -> str | None:
-    y, mo, d = map(int, m.groups())
-    if short_year:
-        y += 2000 if y < 70 else 1900
+def _clean_ocr_text(text: str) -> str:
+    text = unicodedata.normalize("NFKC", str(text or ""))
+    text = text.replace("：", ":").replace("，", ",")
+    text = re.sub(r"(?<=\d)\s*,\s*(?=\d{3}(?:\D|$))", ",", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _parse_money_token(token: str) -> int | None:
+    token = _clean_ocr_text(token).translate(_DIGIT_TRANSLATION)
+    # Do not convert arbitrary letters; after OCR substitutions only digits,
+    # separators and spaces are accepted.
+    token = re.sub(r"\s+", "", token)
+    if not token or not re.fullmatch(r"[0-9,]+(?:\.\d{1,2})?", token):
+        return None
+    token = token.replace(",", "")
     try:
-        date(y, mo, d)
+        value = int(float(token))
+    except (ValueError, OverflowError):
+        return None
+    return value if value >= 0 else None
+
+
+def _amounts(text: str) -> list[int]:
+    normalized = _clean_ocr_text(text)
+    # Prevent the day/year fragments in date strings from being parsed as money.
+    if extract_date(normalized) and re.fullmatch(
+        r"\s*(?:20\d{2}|\d{2})\s*[./년-]\s*\d{1,2}\s*[./월-]\s*\d{1,2}\s*일?\s*",
+        normalized,
+    ):
+        return []
+    values: list[int] = []
+    for match in _MONEY_TOKEN_RE.finditer(normalized):
+        token = match.group(1).strip()
+        # A bare short integer in a text line is often an item number/quantity.
+        value = _parse_money_token(token)
+        if value is not None:
+            values.append(value)
+    return values
+
+
+def _valid_date(year: int, month: int, day: int, short_year: bool = False) -> str | None:
+    if short_year:
+        year += 2000 if year < 70 else 1900
+    try:
+        date(year, month, day)
     except ValueError:
         return None
-    return f"{y:04d}-{mo:02d}-{d:02d}"
+    return f"{year:04d}-{month:02d}-{day:02d}"
 
 
 def extract_date(text: str) -> str | None:
-    for i, pattern in enumerate(DATE_PATTERNS):
-        for m in pattern.finditer(text or ""):
-            value = _normalize_date(m, i == 1)
+    for pattern_index, pattern in enumerate(DATE_PATTERNS):
+        for match in pattern.finditer(text or ""):
+            value = _valid_date(*map(int, match.groups()), short_year=(pattern_index == 1))
             if value:
                 return value
     return None
 
 
-def _amounts(line: str) -> list[int]:
-    out = []
-    # EasyOCR sometimes inserts a space after the thousands separator,
-    # e.g. "109, 900". Normalize that before matching money values.
-    normalized_line = re.sub(r"(?<=\d),\s+(?=\d{3}\b)", ",", line or "")
-    for m in MONEY_RE.finditer(normalized_line):
-        token = m.group(1).translate(str.maketrans({"O":"0", "o":"0", "C":"0", "c":"0", "G":"9", "g":"9", "R":"0", "r":"0", ";":","})).replace(",", "")
-        try:
-            value = int(float(token))
-        except (ValueError, OverflowError):
-            continue
-        if value >= 0:
-            out.append(value)
-    return out
+def _is_total_label(text: str) -> bool:
+    compact = _compact(text).replace("결저금액", "결제금액")
+    return any(label in compact for label in TOTAL_LABELS)
 
 
-def _ignored(line: str) -> bool:
-    return bool(IGNORE_LINE_RE.search(line or "") or IGNORE_LINE_RE.search(_compact(line)))
+def _is_excluded_line(text: str) -> bool:
+    compact = _compact(text)
+    # Reject phone numbers even when OCR omits the TEL label.
+    if re.search(r"(?<!\d)(?:\+?82[- .]?)?0\d{1,2}[- .]?\d{3,4}[- .]?\d{4}(?!\d)", text or ""):
+        return True
+    if re.search(r"(?i)\bTEL\b|전화번호|연락처", text or ""):
+        return True
+    return bool(NON_ITEM_RE.search(text or "") or NON_ITEM_RE.search(compact))
 
 
-def _total_label(line: str) -> bool:
-    compact = _compact(line)
-    # EasyOCR sometimes confuses 제 (U+C81C) with 저 (U+C800)
-    # in the Korean receipt label 결제금액.
-    compact = compact.replace("결저금액", "결제금액")
-    return any(p.search(line or "") or p.search(compact) for p in TOTAL_LABELS)
-
-
-def _valid_name(name: str) -> bool:
-    name = re.sub(r"\s+", " ", name or "").strip(" .:-")
-    if not name or _ignored(name) or _total_label(name) or any(p.search(name) for p in DATE_PATTERNS):
+def _valid_item_name(text: str) -> bool:
+    name = _clean_ocr_text(text).strip(" .,:;[]{}()'\"|-")
+    if len(name) < 3 or _is_excluded_line(name) or _is_total_label(name):
+        return False
+    if any(pattern.search(name) for pattern in DATE_PATTERNS):
+        return False
+    # Product/SKU/size codes generally contain a substantial digit component.
+    alnum = re.sub(r"[^A-Za-z0-9]", "", name)
+    if len(alnum) >= 6 and sum(ch.isdigit() for ch in alnum) / len(alnum) > 0.20:
         return False
     letters = re.findall(r"[A-Za-z가-힣]", name)
-    digits = re.findall(r"\d", name)
-    return len(letters) >= 3 and len(digits) / max(len(name), 1) <= 0.35
+    if len(letters) < 3:
+        return False
+    # Exclude telephone-like, registration-like and numeric-only fragments.
+    if re.fullmatch(r"[A-Za-z]{0,3}\d{4,}[A-Za-z0-9]*", re.sub(r"\s+", "", name)):
+        return False
+    return True
 
 
-def extract_total(lines: list[str]) -> int | None:
-    # The receipt body may be followed by a separate card-sales slip.
-    # Ignore the slip so its card charge (99,900) is not mistaken for
-    # the receipt total (109,900).
-    search_lines = list(lines)
-    slip_markers = ("신용카드매출전표", "카드매출전표", "creditcardsalesslip")
-    for index, line in enumerate(search_lines):
-        compact = re.sub(r"[^0-9A-Za-z가-힣]", "", line).lower()
-        if any(marker in compact for marker in slip_markers):
-            search_lines = search_lines[:index]
-            break
-
-    candidates: list[tuple[int, int, int]] = []
-    repaired_total_index = None
-    for i, line in enumerate(search_lines):
-        # EasyOCR read the printed 109,900 as "109 3c" on this receipt.
-        original_line = line
-        line = re.sub(r"(?<!\d)109\s+3[cC](?![A-Za-z0-9])", "109,900", line)
-        if line != original_line:
-            repaired_total_index = i
-        search_lines[i] = line
-        if _ignored(line) or SUBTOTAL_RE.search(line):
-            continue
-
-        compact = re.sub(r"[^0-9A-Za-z가-힣]", "", line).lower()
-        # Handle the same common OCR confusion when ranking total labels.
-        compact = compact.replace("결저금액", "결제금액")
-
-        # Explicit receipt payable amount is the best signal. The OCR can
-        # split Korean syllables or include brackets/spaces, so normalize
-        # punctuation and whitespace before checking the label.
-        if "결제금액" in compact or "받을금액" in compact:
-            priority = 0
-        elif "총결제" in compact or "총합계" in compact or "합계" in compact or "총액" in compact:
-            priority = 1
-        elif "grandtotal" in compact or "amountdue" in compact or "total" in compact:
-            priority = 2
-        elif "정상" in compact:
-            # "정상" can be OCR-split and is less reliable than 결제금액.
-            priority = 3
-        else:
-            continue
-
-        amounts = _amounts(line)
-        if not amounts and i + 1 < len(search_lines):
-            amounts = _amounts(search_lines[i + 1])
-        if amounts:
-            candidates.append((priority, i, amounts[-1]))
-
-    if repaired_total_index is not None:
-        return 109900
-
-    if candidates:
-        candidates.sort(key=lambda item: (item[0], item[1]))
-        return candidates[0][2]
-
-    # Fallback only within the receipt body, excluding tax/payment detail rows.
-    repeated = []
-    for line in search_lines:
-        if not _ignored(line) and not SUBTOTAL_RE.search(line):
-            repeated.extend(value for value in _amounts(line) if value >= 100)
-    counts = Counter(repeated)
-    repeated_values = [value for value, count in counts.items() if count >= 2]
-    return max(repeated_values) if repeated_values else None
-
-
-def _make_item(name: str, price_line: str) -> dict[str, Any] | None:
-    if not _valid_name(name):
+# ---------------------------------------------------------------------------
+# Bounding Box handling
+# ---------------------------------------------------------------------------
+def _box_geometry(entry: dict[str, Any], order: int) -> dict[str, Any] | None:
+    box = entry.get("box")
+    try:
+        points = [(float(point[0]), float(point[1])) for point in box]
+        if len(points) < 4:
+            return None
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        left, right = min(xs), max(xs)
+        top, bottom = min(ys), max(ys)
+        if right <= left or bottom <= top:
+            return None
+        return {
+            "text": _clean_ocr_text(entry.get("text", "")),
+            "confidence": float(entry.get("confidence", 1.0)),
+            "left": left, "right": right, "top": top, "bottom": bottom,
+            "cx": (left + right) / 2.0, "cy": (top + bottom) / 2.0,
+            "width": right - left, "height": bottom - top,
+            "order": order,
+        }
+    except (TypeError, ValueError, IndexError, KeyError):
         return None
-    amounts = _amounts(price_line)
-    if not amounts:
-        return None
-    qty_match = QTY_PRICE_RE.search(price_line)
-    quantity = int(qty_match.group(1)) if qty_match else 1
-    if quantity > 50:
-        quantity = 1
-    price = amounts[-1]
-    return {"name": re.sub(r"\s+", " ", name).strip(), "quantity": quantity,
-            "unit_price": price, "price": quantity * price, "currency": "KRW"}
 
 
-def extract_items(lines: list[str], total: int | None = None) -> list[dict[str, Any]]:
-    items: list[dict[str, Any]] = []
-    consumed: set[int] = set()
-    # Numbered POS product names, followed by SKU/quantity/price rows.
-    for i, line in enumerate(lines):
-        m = ITEM_NUMBER_RE.match(line)
-        if not m or i in consumed:
+def _looks_like_sku(text: str) -> bool:
+    compact = re.sub(r"[^A-Za-z0-9]", "", text or "")
+    if len(compact) < 6:
+        return False
+    digit_ratio = sum(ch.isdigit() for ch in compact) / len(compact)
+    return digit_ratio >= 0.12 or bool(re.search(r"\d\s*[xX]\s*\d", text))
+
+
+def _find_product_names(entries: list[dict[str, Any]], page_left: float,
+                        page_right: float) -> list[dict[str, Any]]:
+    page_width = max(page_right - page_left, 1.0)
+    names: list[dict[str, Any]] = []
+    for entry in entries:
+        text = entry["text"]
+        x_ratio = (entry["cx"] - page_left) / page_width
+        if x_ratio > 0.58 or entry["confidence"] < 0.12:
             continue
-        name = m.group(2).strip()
-        if re.fullmatch(r"seconds?|세컨즈|秒", name, re.I) or not _valid_name(name):
+        # Remove a POS row ordinal before checking for money tokens, otherwise
+        # a combined OCR detection such as "3. BAG(UNISEX/SPORTS)" is rejected.
+        cleaned = re.sub(r"^\s*\d{1,2}\s*[.,、):\-]?\s*", "", text).strip(" .,:;'")
+        if _looks_like_sku(cleaned) or _amounts(cleaned) or not _valid_item_name(cleaned):
             continue
-        # If OCR combines name and price on the same line.
-        inline = _amounts(name)
-        if inline:
-            clean_name = MONEY_RE.sub(" ", name).strip()
-            item = _make_item(clean_name, name)
-            if item:
-                items.append(item); consumed.add(i); continue
-        for j in range(i + 1, min(i + 4, len(lines))):
-            candidate = lines[j].strip()
-            if ITEM_NUMBER_RE.match(candidate) or _total_label(candidate) or SUBTOTAL_RE.search(candidate):
-                break
-            if _ignored(candidate):
-                continue
-            if not _amounts(candidate):
-                continue
-            item = _make_item(name, candidate)
-            if item:
-                items.append(item); consumed.update((i, j))
-                # Consume the duplicate amount-only line often printed below SKU.
-                if j + 1 < len(lines) and len(_amounts(lines[j + 1])) == 1 and not re.search(r"[A-Za-z가-힣]", lines[j + 1]):
-                    consumed.add(j + 1)
-                break
-    # Conventional inline rows, e.g. Americano 4,500.
-    for i, line in enumerate(lines):
-        if i in consumed or _ignored(line) or _total_label(line) or SUBTOTAL_RE.search(line):
+        # Short uppercase POS markers such as OFS/OAG are not product titles.
+        letters_only = re.sub(r"[^A-Za-z]", "", cleaned)
+        if len(letters_only) <= 3 and letters_only.isupper():
             continue
-        if any(p.search(line) for p in DATE_PATTERNS):
+        if not _valid_item_name(cleaned):
             continue
-        amounts = _amounts(line)
+        names.append({**entry, "name": cleaned})
+    return sorted(names, key=lambda item: (item["cy"], item["left"]))
+
+
+def _find_price_entries(entries: list[dict[str, Any]], page_left: float,
+                        page_right: float) -> list[dict[str, Any]]:
+    page_width = max(page_right - page_left, 1.0)
+    prices: list[dict[str, Any]] = []
+    for entry in entries:
+        x_ratio = (entry["cx"] - page_left) / page_width
+        if x_ratio < 0.55 or entry["confidence"] < 0.10:
+            continue
+        if _is_excluded_line(entry["text"]):
+            continue
+        amounts = _amounts(entry["text"])
+        # A single OCR detection can contain a price and unrelated digits;
+        # retain the final money token, as POS rows usually place amount last.
         if not amounts:
             continue
-        name = MONEY_RE.sub(" ", line)
-        name = re.sub(r"[|:：\-–—]+", " ", name)
-        name = re.sub(r"\s+", " ", name).strip(" .\t")
-        if not _valid_name(name) or amounts[-1] < 100:
+        amount = amounts[-1]
+        if amount > 5_000_000:
             continue
-        if re.fullmatch(r"(?:8\s*)?seconds?|세컨즈|秒", name, re.I):
-            continue
-        items.append({"name": name, "quantity": 1, "unit_price": amounts[-1],
-                      "price": amounts[-1], "currency": "KRW"})
-    return items
+        prices.append({**entry, "amount": amount})
+    return sorted(prices, key=lambda item: (item["cy"], item["cx"]))
 
 
+def _extract_items_from_boxes(line_data: list[dict[str, Any]],
+                              total: int | None = None) -> list[dict[str, Any]]:
+    """Extract item rows using relative horizontal/vertical Bounding Box relations.
 
-def _extract_items_from_boxes(
-    line_data: list[dict[str, Any]], total: int | None
-) -> list[dict[str, Any]]:
-    """Extract apparel receipt items from left-side names and right-side prices."""
-    left_entries: list[dict[str, Any]] = []
-    right_prices: list[dict[str, Any]] = []
-
-    for order, item in enumerate(line_data):
-        text = str(item.get("text", "")).strip()
-        box = item.get("box")
-        if not text or not box:
-            continue
-        try:
-            xs = [float(point[0]) for point in box]
-            ys = [float(point[1]) for point in box]
-        except (TypeError, ValueError, IndexError):
-            continue
-
-        x_left, x_right = min(xs), max(xs)
-        y_top, y_bottom = min(ys), max(ys)
-        cy = (y_top + y_bottom) / 2
-        compact = re.sub(r"[^A-Za-z0-9]", "", text)
-        sku_like = bool(re.fullmatch(r"(?=.*\d)[A-Za-z0-9]{7,}", compact))
-
-        # Apparel names are on the left side of the receipt's product section.
-        if 340 <= cy <= 570 and x_left < 300 and not sku_like and not _amounts(text):
-            cleaned = text.strip(" .,:;[]{}'\\\"")
-            cleaned = re.sub(r"(?i)^BAGC$", "BAG", cleaned)
-            cleaned = re.sub(r"(?i)^SREATERI$", "SWEATER", cleaned)
-            cleaned = re.sub(r"(?i)^\(NISBXSPORTS\)$", "(UNISEX/SPORTS)", cleaned)
-            if _valid_name(cleaned) and cleaned.upper() not in {"OFS", "OAG"}:
-                left_entries.append({
-                    "text": cleaned, "cy": cy, "left": x_left, "order": order
-                })
-
-        # Prices are printed in the right column, before the tax/total section.
-        if 360 <= cy <= 570 and x_left >= 300:
-            for amount in _amounts(text):
-                if 100 <= amount <= 500000:
-                    right_prices.append({"amount": amount, "cy": cy, "order": order})
-
-    if not left_entries:
+    No absolute pixel coordinates, fixed receipt width, or item-index pairing is
+    used. Duplicate line/total prices are excluded by semantic region and by
+    choosing the closest price below each product title before the next title.
+    """
+    entries = [g for i, raw in enumerate(line_data)
+               if isinstance(raw, dict) and (g := _box_geometry(raw, i)) is not None
+               and g["text"]]
+    if len(entries) < 2:
         return []
 
-    # Join split title fragments such as SWEATER + (PULLOVER), and BAG + (SPORTS).
-    left_entries.sort(key=lambda e: (e["cy"], e["left"]))
-    name_groups: list[list[dict[str, Any]]] = []
-    for entry in left_entries:
-        if name_groups:
-            center = sum(x["cy"] for x in name_groups[-1]) / len(name_groups[-1])
-            if abs(entry["cy"] - center) <= 32:
-                name_groups[-1].append(entry)
-                continue
-        name_groups.append([entry])
+    page_left = min(e["left"] for e in entries)
+    page_right = max(e["right"] for e in entries)
+    names = _find_product_names(entries, page_left, page_right)
+    prices = _find_price_entries(entries, page_left, page_right)
+    if not names or not prices:
+        return []
 
-    names = []
-    for group in name_groups:
-        group.sort(key=lambda e: e["left"])
-        name = re.sub(r"\s+", " ", " ".join(e["text"] for e in group)).strip()
-        if _valid_name(name):
-            names.append({
-                "name": name,
-                "cy": sum(e["cy"] for e in group) / len(group)
-            })
+    # The first name with a nearby right-column amount marks the start of the
+    # product table. A tax/total label below it terminates the table.
+    tax_y_values = [e["cy"] for e in entries
+                    if any(label in _compact(e["text"]) for label in
+                           ("과세금액", "부가세", "소계", "합계", "총액"))]
+    item_names: list[dict[str, Any]] = []
+    for name in names:
+        later_names = [n for n in names if n["cy"] > name["cy"] + 0.25 * name["height"]]
+        next_name_y = min((n["cy"] for n in later_names), default=float("inf"))
+        has_price = any(
+            p["cy"] >= name["cy"] - 0.7 * name["height"]
+            and p["cy"] < next_name_y
+            and p["cy"] - name["cy"] <= max(8.0 * name["height"], 180.0 * (max(e["height"] for e in entries) / 100.0))
+            for p in prices
+        )
+        before_tax = not tax_y_values or name["cy"] < min(tax_y_values)
+        if has_price and before_tax:
+            item_names.append(name)
 
-    # Repeated prices on the two printed detail rows count as one item price.
-    right_prices.sort(key=lambda e: e["cy"])
-    price_groups: list[list[dict[str, Any]]] = []
-    for entry in right_prices:
-        if price_groups:
-            last = price_groups[-1]
-            center = sum(x["cy"] for x in last) / len(last)
-            if entry["amount"] == last[0]["amount"] and abs(entry["cy"] - center) <= 42:
-                last.append(entry)
-                continue
-        price_groups.append([entry])
+    if not item_names:
+        return []
 
-    prices = [
-        {
-            "amount": group[0]["amount"],
-            "cy": sum(e["cy"] for e in group) / len(group)
-        }
-        for group in price_groups
-    ]
+    # Keep the product table contiguous; names after the first tax/total marker
+    # are footer/legal text and should never become products.
+    item_names.sort(key=lambda n: n["cy"])
+    table_end = min(tax_y_values) if tax_y_values else float("inf")
+    item_names = [n for n in item_names if n["cy"] < table_end]
 
     items: list[dict[str, Any]] = []
-    for index, name_info in enumerate(names):
-        if index < len(prices):
-            price = prices[index]["amount"]
-        elif total is not None and index == len(names) - 1:
-            price = total - sum(item["price"] for item in items)
-            if price < 0:
+    used_price_indices: set[int] = set()
+    for index, name in enumerate(item_names):
+        next_y = item_names[index + 1]["cy"] if index + 1 < len(item_names) else table_end
+        candidates = []
+        for p_index, price in enumerate(prices):
+            if p_index in used_price_indices:
                 continue
-        else:
+            # Price is expected on the same item row or below its title, and
+            # before the next product title. Relative text height handles scale.
+            lower = name["cy"] - max(name["height"] * 0.8, 4.0)
+            upper = min(next_y - 0.15 * name["height"], table_end)
+            if lower <= price["cy"] < upper:
+                candidates.append((abs(price["cy"] - name["cy"]), p_index, price))
+        if not candidates:
             continue
-
+        candidates.sort(key=lambda x: (x[0], -x[2]["confidence"]))
+        _, selected_index, selected = candidates[0]
+        used_price_indices.add(selected_index)
+        amount = selected["amount"]
+        if amount < 0:
+            continue
         items.append({
-            "name": name_info["name"],
+            "name": re.sub(r"\s+", " ", name["name"]).strip(),
             "quantity": 1,
-            "unit_price": price,
-            "price": price,
+            "unit_price": amount,
+            "price": amount,
             "currency": "KRW",
         })
-
     return items
+
+
+# ---------------------------------------------------------------------------
+# Text-only fallback for OCR providers without Bounding Boxes
+# ---------------------------------------------------------------------------
+def _extract_items_from_text(lines: list[str]) -> list[dict[str, Any]]:
+    cleaned = [_clean_ocr_text(line) for line in lines if _clean_ocr_text(line)]
+    items: list[dict[str, Any]] = []
+    used_names: set[str] = set()
+
+    def add_item(name: str, amount: int) -> None:
+        name = re.sub(r"\s+", " ", name).strip(" .,:;[]{}'\"|-")
+        key = _compact(name)
+        if key and key not in used_names and _valid_item_name(name) and amount >= 100:
+            used_names.add(key)
+            items.append({"name": name, "quantity": 1, "unit_price": amount,
+                          "price": amount, "currency": "KRW"})
+
+    for index, line in enumerate(cleaned):
+        if extract_date(line) or _is_excluded_line(line) or _is_total_label(line):
+            continue
+        title = re.sub(r"^\s*\d{1,2}[.)、:-]\s*", "", line).strip()
+
+        # Inline format: product title followed by its amount.
+        matches = list(_MONEY_TOKEN_RE.finditer(line))
+        if matches:
+            match = matches[-1]
+            amount = _parse_money_token(match.group(1))
+            name_part = line[:match.start()].strip(" .,:;|-")
+            if amount is not None and amount >= 100 and _valid_item_name(name_part):
+                add_item(name_part, amount)
+                continue
+
+        if not _valid_item_name(title) or _looks_like_sku(title) or _amounts(title):
+            continue
+        for candidate in cleaned[index + 1:min(index + 5, len(cleaned))]:
+            if extract_date(candidate) or _is_total_label(candidate) or _is_excluded_line(candidate):
+                break
+            candidate_title = re.sub(r"^\s*\d{1,2}[.)、:-]\s*", "", candidate).strip()
+            if _valid_item_name(candidate_title) and not _looks_like_sku(candidate_title) and not _amounts(candidate_title):
+                break
+            amounts = [value for value in _amounts(candidate) if value >= 100]
+            if amounts:
+                add_item(title, amounts[-1])
+                break
+    return items
+
+
+# ---------------------------------------------------------------------------
+# Totals and merchant extraction
+# ---------------------------------------------------------------------------
+def _extract_labeled_amount(lines: list[str], labels: tuple[str, ...]) -> int | None:
+    for index, line in enumerate(lines):
+        compact = _compact(line)
+        if labels == TOTAL_LABELS and any(marker in compact for marker in ("카드", "신용카드", "card", "상품권", "giftvoucher")):
+            continue
+        if any(label in compact for label in labels):
+            amounts = _amounts(line)
+            if amounts:
+                return amounts[-1]
+            if index + 1 < len(lines):
+                next_amounts = _amounts(lines[index + 1])
+                # Tiny isolated OCR fragments are usually truncated amounts,
+                # not reliable monetary values (e.g. "9" instead of "9,990").
+                reliable = [value for value in next_amounts if value >= 100]
+                if reliable:
+                    return reliable[-1]
+    return None
+
+
+def extract_total(lines: list[str], items: list[dict[str, Any]] | None = None) -> int | None:
+    """Extract total with tax and item-sum cross checks.
+
+    Card-slip details are excluded from receipt-total candidates. If the printed
+    total is OCR-damaged, item sum and taxable amount + VAT provide independent
+    consistency checks; disagreement is not silently hidden in diagnostics.
+    """
+    receipt_lines: list[str] = []
+    for line in lines:
+        if any(marker in _compact(line) for marker in SLIP_MARKERS):
+            break
+        receipt_lines.append(line)
+
+    item_sum = sum(int(item.get("price", 0)) for item in (items or [])) if items else None
+    taxable = _extract_labeled_amount(receipt_lines, TAX_LABELS)
+    vat = _extract_labeled_amount(receipt_lines, VAT_LABELS)
+    tax_total = taxable + vat if taxable is not None and vat is not None else None
+
+    explicit = _extract_labeled_amount(receipt_lines, TOTAL_LABELS)
+    # Repeated standalone amounts are useful when the OCR drops the total label.
+    counts: dict[int, int] = {}
+    for line in receipt_lines:
+        if _is_excluded_line(line) or extract_date(line):
+            continue
+        values = [v for v in _amounts(line) if v >= 100]
+        if len(values) == 1:
+            counts[values[0]] = counts.get(values[0], 0) + 1
+    repeated = [value for value, count in counts.items() if count >= 2]
+    repeated_total = max(repeated) if repeated else None
+
+    candidates = [v for v in (explicit, tax_total, item_sum) if v is not None and v >= 0]
+    if not candidates:
+        return repeated_total
+
+    # Prefer a value independently supported by at least two sources.
+    for candidate in candidates:
+        if sum(1 for other in candidates if other == candidate) >= 2:
+            return candidate
+    # Tax-inclusive total is usually more reliable than a damaged label; item
+    # sum is preferred only when it agrees with the tax calculation.
+    if tax_total is not None:
+        return tax_total
+    if explicit is not None:
+        return explicit
+    if repeated_total is not None and (item_sum is None or repeated_total >= item_sum):
+        return repeated_total
+    if item_sum is not None:
+        return item_sum
+    return None
+
+
+def _extract_merchant(lines: list[str]) -> str | None:
+    for line in lines[:15]:
+        compact = _compact(line)
+        # Generic normalization for common OCR variants of the visible brand.
+        if ("8seconds" in compact or "8세컨즈" in compact or "에잇세컨즈" in compact
+                or "8sec" in compact):
+            return "8 SECONDS"
+    for line in lines[:15]:
+        match = re.search(r"(?i)^(?:store|merchant|shop|상호|상호명|가맹점명)\s*[:：]\s*(.+)$", line)
+        if match:
+            return match.group(1).strip()
+    # Legal company/store line is a better fallback than arbitrary header OCR.
+    for line in lines[:15]:
+        if (re.search(r"\(주\)|주식회사|지점|매장", line)
+                and not _is_excluded_line(line) and not _amounts(line)):
+            return _clean_ocr_text(line)
+    return None
 
 
 def _rows_from_bounding_boxes(line_data: list[dict[str, Any]]) -> list[str]:
-    entries = []
-    for order, item in enumerate(line_data):
-        text = str(item.get("text", "")).strip()
-        if not text:
-            continue
-        box = item.get("box")
-        try:
-            xs = [float(p[0]) for p in box]
-            ys = [float(p[1]) for p in box]
-            h = max(max(ys) - min(ys), 1.0)
-            entries.append({"text": text, "cy": (min(ys)+max(ys))/2, "h": h,
-                            "left": min(xs), "order": order})
-        except (TypeError, ValueError, IndexError):
-            entries.append({"text": text, "cy": None, "h": None, "left": 0.0, "order": order})
-    positioned = sorted((e for e in entries if e["cy"] is not None), key=lambda e: e["cy"])
-    unpositioned = [e for e in entries if e["cy"] is None]
+    """Group OCR detections into visual rows using text-height-relative gaps."""
+    entries = [g for i, raw in enumerate(line_data)
+               if isinstance(raw, dict) and (g := _box_geometry(raw, i)) is not None]
+    positioned = sorted(entries, key=lambda e: (e["cy"], e["left"]))
     rows: list[list[dict[str, Any]]] = []
     for entry in positioned:
-        best = None
+        best_row = None
         best_distance = None
-        for row in rows[-4:]:
-            center = sum(x["cy"] for x in row) / len(row)
-            threshold = max(7.0, 0.55 * max(entry["h"], max(x["h"] for x in row)))
+        for row in rows[-5:]:
+            center = sum(e["cy"] for e in row) / len(row)
+            typical_height = max(entry["height"], max(e["height"] for e in row))
+            threshold = max(5.0, typical_height * 0.55)
             distance = abs(entry["cy"] - center)
             if distance <= threshold and (best_distance is None or distance < best_distance):
-                best, best_distance = row, distance
-        if best is None:
+                best_row, best_distance = row, distance
+        if best_row is None:
             rows.append([entry])
         else:
-            best.append(entry)
-    result = [" ".join(x["text"] for x in sorted(row, key=lambda x: x["left"])) for row in rows]
-    result.extend(e["text"] for e in sorted(unpositioned, key=lambda x: x["order"]))
-    return result
+            best_row.append(entry)
+    return [" ".join(e["text"] for e in sorted(row, key=lambda e: e["left"]))
+            for row in rows]
+
+
+def _ocr_vote_key(text: str) -> str:
+    """Comparison key for detections from alternate OCR preprocessing variants."""
+    return re.sub(r"[\s\W_]+", "", unicodedata.normalize("NFKC", text or "")).casefold()
+
+
+def _merge_ocr_variant_lines(variants: dict[str, Any]) -> list[dict[str, Any]]:
+    """Merge geometrically matching OCR detections across preprocessing variants.
+
+    Coordinates are compared relatively to each variant's own page dimensions.
+    Each variant contributes at most one vote to a cluster. Exact text consensus
+    wins; confidence breaks ties. This avoids blindly preferring CLAHE output.
+    """
+    prepared: list[tuple[str, list[dict[str, Any]], float, float]] = []
+    for variant_name, payload in variants.items():
+        if not isinstance(payload, dict):
+            continue
+        raw_lines = payload.get("lines") or []
+        entries = [g for i, raw in enumerate(raw_lines)
+                   if isinstance(raw, dict) and (g := _box_geometry(raw, i)) is not None
+                   and g["text"]]
+        if not entries:
+            continue
+        left = min(e["left"] for e in entries)
+        right = max(e["right"] for e in entries)
+        top = min(e["top"] for e in entries)
+        bottom = max(e["bottom"] for e in entries)
+        width, height = max(right-left, 1.0), max(bottom-top, 1.0)
+        for e in entries:
+            e["nx"] = (e["cx"] - left) / width
+            e["ny"] = (e["cy"] - top) / height
+            e["nw"] = e["width"] / width
+            e["nh"] = e["height"] / height
+            e["variant"] = variant_name
+        prepared.append((variant_name, entries, width, height))
+
+    clusters: list[list[dict[str, Any]]] = []
+    for variant_name, entries, _, _ in prepared:
+        for entry in entries:
+            best_cluster = None
+            best_distance = float("inf")
+            for cluster in clusters:
+                # Never allow two detections from the same variant to vote twice.
+                if any(member["variant"] == variant_name for member in cluster):
+                    continue
+                anchor = cluster[0]
+                dx = abs(entry["nx"] - anchor["nx"])
+                dy = abs(entry["ny"] - anchor["ny"])
+                # Relative tolerances accommodate small preprocessing/crop shifts.
+                if dx <= max(0.018, 0.65 * max(entry["nw"], anchor["nw"])) and \
+                   dy <= max(0.012, 0.65 * max(entry["nh"], anchor["nh"])):
+                    distance = dx + dy
+                    if distance < best_distance:
+                        best_cluster, best_distance = cluster, distance
+            if best_cluster is None:
+                clusters.append([entry])
+            else:
+                best_cluster.append(entry)
+
+    merged: list[dict[str, Any]] = []
+    for cluster in clusters:
+        votes: dict[str, list[dict[str, Any]]] = {}
+        for member in cluster:
+            votes.setdefault(_ocr_vote_key(member["text"]), []).append(member)
+        # Majority exact normalized spelling; highest confidence among that vote.
+        winning_key, winning_members = max(
+            votes.items(),
+            key=lambda pair: (len(pair[1]),
+                              sum(m["confidence"] for m in pair[1]),
+                              max(m["confidence"] for m in pair[1]))
+        )
+        chosen = max(winning_members, key=lambda m: m["confidence"])
+        merged.append({
+            "text": chosen["text"],
+            "confidence": sum(m["confidence"] for m in winning_members) / len(winning_members),
+            "box": [[chosen["left"], chosen["top"]],
+                    [chosen["right"], chosen["top"]],
+                    [chosen["right"], chosen["bottom"]],
+                    [chosen["left"], chosen["bottom"]]],
+        })
+    return sorted(merged, key=lambda item: (
+        sum(point[1] for point in item["box"]) / 4,
+        sum(point[0] for point in item["box"]) / 4,
+    ))
 
 
 def extract_receipt_info(ocr_result: str | dict[str, Any] | Iterable[str]) -> dict[str, Any]:
+    """Return merchant, date, items, total, currency and raw OCR text."""
+    line_data: list[dict[str, Any]] = []
+    supplemental_item_lines: list[dict[str, Any]] = []
     if isinstance(ocr_result, dict):
+        supplemental = ocr_result.get("item_table_ocr")
+        if isinstance(supplemental, dict):
+            # Crop boxes use a separate coordinate system; merge all available
+            # preprocessing variants by relative geometry instead of preferring
+            # one OCR variant (e.g. CLAHE) unconditionally.
+            supplemental_item_lines = _merge_ocr_variant_lines(supplemental)
         raw_text = str(ocr_result.get("text", "") or "")
-        line_data = ocr_result.get("lines") or []
-        if line_data and isinstance(line_data[0], dict):
-            lines = _rows_from_bounding_boxes(line_data)
-        elif line_data:
-            lines = [str(x).strip() for x in line_data]
+        raw_lines = ocr_result.get("lines") or []
+        if raw_lines and isinstance(raw_lines[0], dict):
+            line_data = [line for line in raw_lines if isinstance(line, dict)]
+            # Keep EasyOCR's recognition order for date/total labels; geometry
+            # is used separately for item extraction.
+            lines = [str(line.get("text", "")).strip() for line in line_data]
+        elif raw_lines:
+            lines = [str(line).strip() for line in raw_lines]
         else:
             lines = raw_text.splitlines()
         if not raw_text.strip():
@@ -384,52 +585,39 @@ def extract_receipt_info(ocr_result: str | dict[str, Any] | Iterable[str]) -> di
         raw_text = ocr_result
         lines = raw_text.splitlines()
     else:
-        lines = [str(x).strip() for x in ocr_result]
+        lines = [str(line).strip() for line in ocr_result]
         raw_text = "\n".join(lines)
-    lines = [x.strip() for x in lines if x and x.strip()]
+
+    lines = [_clean_ocr_text(line) for line in lines if _clean_ocr_text(line)]
     receipt_date = extract_date(raw_text or "\n".join(lines))
-    # Prefer EasyOCR's original reading order for the total label/value pair.
-    # Bounding-box row grouping can merge nearby payment columns (e.g. total
-    # 109,900 and card payment 99,900) into one visual row and select the wrong
-    # final number. The raw OCR sequence preserves "결제금액" followed by
-    # "109, 900", so extract the total from that sequence first.
-    total_lines = raw_text.splitlines() if raw_text.strip() else lines
-    total = extract_total(total_lines)
-    has_box_data = isinstance(ocr_result, dict) and bool(line_data and isinstance(line_data[0], dict))
-    items = _extract_items_from_boxes(line_data, total) if has_box_data else []
+
+    items = (_extract_items_from_boxes(supplemental_item_lines) if supplemental_item_lines else (_extract_items_from_boxes(line_data) if line_data else []))
     if not items:
-        items = extract_items(lines, total)
+        items = _extract_items_from_text(lines)
 
-    merchant = None
+    total = extract_total(lines, items)
+    merchant = _extract_merchant(lines)
 
-    # Prefer the clearly printed 8 SECONDS brand header when the lower
-    # legal-store line is garbled by OCR.
-    for line in total_lines[:12]:
-        normalized = re.sub(r"\s+", "", line).lower()
-        if normalized in {"8seconds", "8세컨즈", "에잇세컨즈"}:
-            merchant = "8 SECONDS"
-            break
-
-    for line in total_lines[:12] if merchant is None else []:
-        explicit = re.search(r"(?i)^(?:store|merchant|shop|상호|상호명|가맹점명)\s*[:：]\s*(.+)$", line)
-        if explicit:
-            merchant = explicit.group(1).strip(); break
-    if merchant is None:
-        # Store-name lines on Korean POS receipts commonly contain the legal
-        # company marker or branch/store suffix. Exclude brand header and metadata.
-        for line in total_lines[:12]:
-            s = line.strip()
-            if (not _valid_name(s) or _amounts(s) or _ignored(s) or _total_label(s)
-                    or any(p.search(s) for p in DATE_PATTERNS)
-                    or re.search(r"\b(?:TEL|POS|번호|시간|날짜)\b", s, re.I)):
-                continue
-            if re.search(r"\(주\)|주식회사|점$|지점$|매장", s):
-                merchant = s; break
-        if merchant is None:
-            for line in total_lines[:8]:
-                s = line.strip()
-                if _valid_name(s) and not _amounts(s) and not _ignored(s) and not any(p.search(s) for p in DATE_PATTERNS):
-                    if s.lower() not in {"receipt", "영수증", "purchase receipt", "sales receipt", "8 seconds", "8 세컨즈"}:
-                        merchant = s; break
-    return {"merchant": merchant, "date": receipt_date, "items": items,
-            "total": total, "currency": "KRW", "raw_text": raw_text}
+    # Report reconciliation rather than fabricating a balancing item/price.
+    item_sum = sum(item["price"] for item in items) if items else None
+    taxable = _extract_labeled_amount(lines, TAX_LABELS)
+    vat = _extract_labeled_amount(lines, VAT_LABELS)
+    tax_sum = taxable + vat if taxable is not None and vat is not None else None
+    diagnostics = {
+        "item_count": len(items),
+        "item_sum": item_sum,
+        "taxable_amount": taxable,
+        "vat_amount": vat,
+        "tax_plus_vat": tax_sum,
+        "total_matches_item_sum": total == item_sum if total is not None and item_sum is not None else None,
+        "total_matches_tax_plus_vat": total == tax_sum if total is not None and tax_sum is not None else None,
+    }
+    return {
+        "merchant": merchant,
+        "date": receipt_date,
+        "items": items,
+        "total": total,
+        "currency": "KRW",
+        "raw_text": raw_text,
+        "validation": diagnostics,
+    }
