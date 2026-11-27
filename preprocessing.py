@@ -1,4 +1,4 @@
-"""ReceiptVision Pipeline V5 — self-contained experimental hybrid detector.
+"""ReceiptVision Pipeline V5.4 — self-contained experimental hybrid detector.
 No GT/CSV/JSON is read for inference. Legacy algorithms are embedded in memory.
 """
 from pathlib import Path
@@ -70,7 +70,7 @@ def make_ocr_variants(warped):
     cb=cv2.GaussianBlur(clahe,(3,3),0)
     def adapt(im,block):
         return cv2.adaptiveThreshold(im,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY,block,10)
-    return {'grayscale':gray,'baseline_adaptive':adapt(gb,31),
+    return {'grayscale':gray,'clahe':clahe,'baseline_adaptive':adapt(gb,31),
             'clahe_gaussian_b21_c10':adapt(cb,21),
             'clahe_gaussian_b31_c10':adapt(cb,31),
             'clahe_gaussian_b41_c10':adapt(cb,41),
@@ -215,36 +215,366 @@ def make_ocr_safe_corners(corners, image_shape, correction_reason):
     return order_points(corners)
 
 
-def preprocess_receipt(image_input,method='dynamic'):
+CONTRAST_THRESHOLD = 10
+STRIP_WIDTH = 12
+GAP = 3
+STEP = 5
+MAX_WEAK_RUN = 6
+SAFETY_MARGIN = 30
+
+
+def point_at_y(top, bottom, y):
+    """좌우 경계선 위의 좌표 계산."""
+
+    dy = bottom[1] - top[1]
+
+    if abs(dy) < 1e-6:
+        raise ValueError("Invalid boundary")
+
+    ratio = (y - top[1]) / dy
+
+    return top + ratio * (bottom - top)
+
+
+def boundary_contrast(gray, x, y):
+    """경계 양쪽의 평균 밝기 차이 계산."""
+
+    height, width = gray.shape
+
+    x = int(round(x))
+    y = int(round(y))
+
+    margin = GAP + STRIP_WIDTH
+
+    if not 0 <= y < height:
+        return 0.0
+
+    if x - margin < 0:
+        return 0.0
+
+    if x + margin > width:
+        return 0.0
+
+    y0 = max(0, y - 2)
+    y1 = min(height, y + 3)
+
+    left = gray[
+        y0:y1,
+        x - margin:x - GAP,
+    ]
+
+    right = gray[
+        y0:y1,
+        x + GAP:x + margin,
+    ]
+
+    if left.size == 0 or right.size == 0:
+        return 0.0
+
+    return abs(
+        float(np.mean(left))
+        - float(np.mean(right))
+    )
+
+
+def measure_sides(gray, corners, y):
+
+    tl, tr, br, bl = corners
+
+    left_point = point_at_y(tl, bl, y)
+    right_point = point_at_y(tr, br, y)
+
+    left = boundary_contrast(
+        gray, left_point[0], y
+    )
+
+    right = boundary_contrast(
+        gray, right_point[0], y
+    )
+
+    return left, right
+
+
+def search_boundary(
+    gray,
+    corners,
+    start_y,
+    direction,
+):
+    """경계 연속성을 이용해 상단 또는 하단 탐색."""
+
+    height = gray.shape[0]
+
+    start_y = int(np.clip(
+        round(start_y), 0, height - 1
+    ))
+
+    last_valid = start_y
+    weak_run = 0
+    strong_count = 0
+    bilateral_count = 0
+
+    samples = []
+
+    y = start_y + direction * STEP
+
+    while 0 <= y < height:
+
+        left, right = measure_sides(
+            gray, corners, y
+        )
+
+        strong = (
+            max(left, right)
+            >= CONTRAST_THRESHOLD
+        )
+
+        bilateral = (
+            min(left, right)
+            >= CONTRAST_THRESHOLD
+        )
+
+        samples.append({
+            "y": y,
+            "left": round(left, 2),
+            "right": round(right, 2),
+            "valid": bool(strong),
+        })
+
+        if strong:
+
+            last_valid = y
+            weak_run = 0
+            strong_count += 1
+
+            if bilateral:
+                bilateral_count += 1
+
+        else:
+
+            weak_run += 1
+
+            if weak_run >= MAX_WEAK_RUN:
+                break
+
+        y += direction * STEP
+
+    # 충분한 경계 증거가 없으면 확장하지 않음
+    if strong_count < 3 or bilateral_count < 2:
+        return start_y, samples
+
+    target = (
+        last_valid
+        + direction * SAFETY_MARGIN
+    )
+
+    target = int(np.clip(
+        target, 0, height - 1
+    ))
+
+    return target, samples
+
+
+def auto_extend_boundaries(image, corners):
+
+    height, width = image.shape[:2]
+
+    corners = np.asarray(
+        corners, dtype=np.float32
+    )
+
+    tl, tr, br, bl = corners
+
+    gray = cv2.cvtColor(
+        image, cv2.COLOR_BGR2GRAY
+    )
+
+    gray = cv2.GaussianBlur(
+        gray, (5, 5), 0
+    )
+
+    original_top = float(
+        min(tl[1], tr[1])
+    )
+
+    original_bottom = float(
+        max(bl[1], br[1])
+    )
+
+    top_y, top_samples = search_boundary(
+        gray,
+        corners,
+        original_top,
+        direction=-1,
+    )
+
+    bottom_y, bottom_samples = search_boundary(
+        gray,
+        corners,
+        original_bottom,
+        direction=1,
+    )
+
+    extended = corners.copy()
+
+    # 아주 작은 확장은 적용하지 않음
+    top_changed = (
+        original_top - top_y >= 20
+    )
+
+    bottom_changed = (
+        bottom_y - original_bottom >= 20
+    )
+
+    if top_changed:
+
+        extended[0] = point_at_y(
+            tl, bl, top_y
+        )
+
+        extended[1] = point_at_y(
+            tr, br, top_y
+        )
+
+    if bottom_changed:
+
+        extended[2] = point_at_y(
+            tr, br, bottom_y
+        )
+
+        extended[3] = point_at_y(
+            tl, bl, bottom_y
+        )
+
+    extended[:, 0] = np.clip(
+        extended[:, 0], 0, width - 1
+    )
+
+    extended[:, 1] = np.clip(
+        extended[:, 1], 0, height - 1
+    )
+
+    original_area = abs(
+        cv2.contourArea(corners)
+    )
+
+    extended_area = abs(
+        cv2.contourArea(extended)
+    )
+
+    # 잘못된 사각형 또는 면적 감소 방지
+    if (
+        not valid_quad(
+            extended, width, height
+        )
+        or extended_area < original_area
+    ):
+
+        extended = corners.copy()
+
+        top_changed = False
+        bottom_changed = False
+
+        extended_area = original_area
+
+    metadata = {
+        "top_extended": bool(top_changed),
+        "bottom_extended": bool(bottom_changed),
+        "original_top": original_top,
+        "original_bottom": original_bottom,
+        "target_top": top_y,
+        "target_bottom": bottom_y,
+        "area_ratio": (
+            extended_area / original_area
+            if original_area > 0 else 1.0
+        ),
+        "top_samples": top_samples,
+        "bottom_samples": bottom_samples,
+    }
+
+    return extended, metadata
+
+
+HYBRID_WIDTH_THRESHOLD = 600
+
+CLAHE_CLIP_LIMIT = 2.0
+CLAHE_TILE_GRID_SIZE = (8, 8)
+
+
+def select_preprocessing_method(width):
+    """
+    원근 보정된 이미지의 너비를 기준으로
+    OCR 전처리 방식을 선택한다.
+    """
+
+    if width < HYBRID_WIDTH_THRESHOLD:
+        return "clahe"
+
+    return "dynamic"
+
+
+def apply_clahe(warped):
+    """
+    원근 보정 이미지에 Grayscale 및 CLAHE를 적용한다.
+    Adaptive Threshold는 적용하지 않는다.
+    """
+
+    gray = cv2.cvtColor(
+        warped,
+        cv2.COLOR_BGR2GRAY,
+    )
+
+    clahe = cv2.createCLAHE(
+        clipLimit=CLAHE_CLIP_LIMIT,
+        tileGridSize=CLAHE_TILE_GRID_SIZE,
+    )
+
+    return clahe.apply(gray)
+
+
+def preprocess_receipt(image_input, method="hybrid"):
+    """Detect, extend, warp once, and select the OCR preprocessing variant."""
     try:
-        image=read_image(image_input) if isinstance(image_input,(str,Path)) else image_input.copy()
-        if image.ndim!=3 or image.shape[2]!=3:raise ValueError('BGR 이미지 필요')
-        result=detect_receipt(image)
-        if not result['success']:raise ValueError(result['error'])
-        corners=result['corners']
-        ocr_corners=make_ocr_safe_corners(corners,image.shape,result['top_correction'])
-        warped=warp_receipt(image,ocr_corners)
-        variants=make_ocr_variants(warped)
-        if method not in variants:raise ValueError('지원하지 않는 OCR 전처리: '+method)
-        block_size = {
-            'grayscale': None, 'baseline_adaptive': 31,
-            'clahe_gaussian_b21_c10': 21, 'clahe_gaussian_b31_c10': 31,
-            'clahe_gaussian_b41_c10': 41,
-            'dynamic': get_dynamic_block_size(warped.shape[1])
-        }[method]
-        actual_method = (f'clahe_gaussian_b{block_size}_c10'
-                         if method == 'dynamic' else method)
-        return {'success':True,'error':None,'corners':corners.tolist(),
-                'ocr_corners':ocr_corners.tolist(),
-                'detection_score':result['score'],'detection_source':result['source'],
-                'candidate_count':result['candidate_count'],'top_candidates':result['top_candidates'],
-                'warped':warped,'ocr_image':variants[method],'variants':variants,
-                'detection_overlay':draw_detection(image,corners),'method':method,
-                'actual_method':actual_method,
-                'block_size':block_size,'preprocessing_mode':method,
-                'top_correction':result['top_correction']}
-    except (ValueError,TypeError,OSError,cv2.error) as exc:
-        return {'success':False,'error':str(exc),'corners':None,'detection_score':None,
-                'detection_source':None,'ocr_corners':None,'candidate_count':0,'top_candidates':[],
-                'warped':None,'ocr_image':None,'variants':{},'detection_overlay':None,
-                'method':method,'actual_method':None,'top_correction':None,'block_size':None,'preprocessing_mode':method}
+        image = read_image(image_input) if isinstance(image_input, (str, Path)) else image_input.copy()
+        if image.ndim != 3 or image.shape[2] != 3:
+            raise ValueError('BGR 이미지 필요')
+        result = detect_receipt(image)
+        if not result['success']:
+            raise ValueError(result['error'])
+        corners = result['corners']
+        safe = make_ocr_safe_corners(corners, image.shape, result['top_correction'])
+        extended, metadata = auto_extend_boundaries(image, safe)
+        changed = metadata['top_extended'] or metadata['bottom_extended']
+        ocr_corners = extended if changed else safe
+        warped = warp_receipt(image, ocr_corners)
+        height, width = warped.shape[:2]
+        variants = make_ocr_variants(warped)
+        selected = select_preprocessing_method(width) if method == 'hybrid' else method
+        if selected not in variants:
+            raise ValueError('지원하지 않는 OCR 전처리: ' + str(method))
+        block_size = {'grayscale': None, 'clahe': None, 'baseline_adaptive': 31,
+                      'clahe_gaussian_b21_c10': 21, 'clahe_gaussian_b31_c10': 31,
+                      'clahe_gaussian_b41_c10': 41, 'dynamic': get_dynamic_block_size(width)}[selected]
+        actual = f'clahe_gaussian_b{block_size}_c10' if selected == 'dynamic' else selected
+        ocr_image = variants[selected]
+        if ocr_image.ndim != 2 or ocr_image.dtype != np.uint8 or not ocr_image.size:
+            raise ValueError('Invalid OCR image')
+        return {'success': True, 'error': None, 'corners': corners.tolist(),
+                'ocr_corners': ocr_corners.tolist(), 'detection_score': result['score'],
+                'detection_source': result['source'], 'candidate_count': result['candidate_count'],
+                'top_candidates': result['top_candidates'], 'warped': warped,
+                'ocr_image': ocr_image, 'variants': variants,
+                'detection_overlay': draw_detection(image, ocr_corners if changed else corners),
+                'method': method, 'actual_method': actual, 'block_size': block_size,
+                'preprocessing_mode': method, 'top_correction': result['top_correction'],
+                'boundary_extension': metadata, 'selected_method': selected,
+                'preprocessing_version': 'V5.4', 'hybrid_selection': {
+                    'enabled': method == 'hybrid', 'warped_width': width, 'warped_height': height,
+                    'width_threshold': HYBRID_WIDTH_THRESHOLD, 'selected_method': selected}}
+    except (ValueError, TypeError, OSError, cv2.error, AttributeError) as exc:
+        return {'success': False, 'error': str(exc), 'corners': None, 'detection_score': None,
+                'detection_source': None, 'ocr_corners': None, 'candidate_count': 0, 'top_candidates': [],
+                'warped': None, 'ocr_image': None, 'variants': {}, 'detection_overlay': None,
+                'method': method, 'actual_method': None, 'top_correction': None, 'block_size': None,
+                'preprocessing_mode': method, 'selected_method': None, 'boundary_extension': None,
+                'hybrid_selection': None, 'preprocessing_version': 'V5.4'}

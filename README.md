@@ -16,7 +16,8 @@
 - 영수증 모서리 검출 및 후보 영역 평가
 - Perspective Transform을 통한 원근 왜곡 보정
 - 영수증 상단 정보 손실 방지
-- Dynamic Adaptive Threshold 기반 이미지 전처리
+- V5.3 자동 상하단 경계 확장
+- V5.4 Hybrid 전처리 (CLAHE / Dynamic Adaptive Threshold)
 - EasyOCR 기반 한글 및 영문 문자 인식
 - 상호명, 날짜, 상품명, 수량 및 금액 추출
 - 상품 합계와 총금액의 일치 여부 검증
@@ -30,11 +31,13 @@ flowchart TD
     A[Input Receipt Image] --> B[Receipt Detection]
     B --> C[Corner Estimation]
     C --> D[Header Safety Correction]
-    D --> E[Perspective Transform]
+    D --> X[Automatic Boundary Extension]
+    X --> E[Perspective Transform]
     E --> F[Grayscale and CLAHE]
-    F --> G[Gaussian Blur]
-    G --> H[Dynamic Adaptive Threshold]
-    H --> I[EasyOCR]
+    F --> G{Warped width below 600 px?}
+    G -->|Yes| I[EasyOCR]
+    G -->|No| H[Gaussian Blur and Dynamic Adaptive Threshold]
+    H --> I
     I --> J[Information Extraction]
     J --> K[Data Validation]
     K --> L[JSON Output]
@@ -105,7 +108,30 @@ def get_dynamic_block_size(width):
 | Block Size | 21 ~ 81 (홀수) |
 | Threshold Constant C | 10 |
 
-기본 전처리 모드는 `dynamic`이며, 기존 고정 Block Size 방식도 선택할 수 있습니다.
+`dynamic`은 V5.4에서도 직접 선택할 수 있으며 기존 고정 Block Size 방식도 유지합니다.
+
+### 3.5 Automatic Boundary Extension (V5.3)
+
+상단 보호 이후 좌우 경계선을 연장하고 경계 양쪽의 평균 밝기 차이를 조사하여 상하단의 잘림을 완화합니다. 충분한 경계 연속성이 확인될 때만 확장하며, 유효하지 않은 사각형이나 면적 감소가 발생하면 기존 좌표를 유지합니다. 최종 OCR용 좌표를 확정한 뒤 원근 변환을 한 번 수행합니다.
+
+| Parameter | Value |
+|---|---:|
+| Contrast threshold | 10 |
+| Strip width | 12 px |
+| Gap | 3 px |
+| Search step | 5 px |
+| Maximum consecutive weak samples | 6 |
+| Safety margin | 30 px |
+
+### 3.6 Hybrid Preprocessing (V5.4)
+
+기본 전처리 모드는 `hybrid`입니다. 원근 보정 후 너비가 600px 미만이면 CLAHE만 적용하고, 600px 이상이면 V5.2 Dynamic 방식을 적용합니다. CLAHE는 이진화로 인한 문자 손실을 줄이기 위한 선택이며, 600px은 현재 실험 데이터에서 선정한 경험적 기준입니다. OCR은 선택된 이미지에 대해 한 번 실행합니다.
+
+| Warped width | Selected method | Block Size |
+|---|---|---|
+| < 600 px | clahe | None |
+| >= 600 px | dynamic | 21 ~ 81 (홀수) |
+
 
 ## 4. Project Structure
 
@@ -150,7 +176,7 @@ RecieptVision-KW/
 | information_extractor.py | 영수증 주요 정보 추출 및 검증 |
 | receipt_pipeline.py | 전체 파이프라인 실행 |
 | receiptvision_example.py | 전처리 모듈 사용 예제 |
-| batch_test.py | V5.2 기반 일괄 전처리 및 CSV 결과 저장 |
+| batch_test.py | V5.4 기반 일괄 전처리 및 CSV 결과 저장 |
 | run_items_ocr.py | 상품 영역 OCR 실험용 스크립트 |
 | merge_receipt_ocr.py | 복수 OCR 결과 병합용 스크립트 |
 | tests/fixtures/ | 회귀 테스트용 JSON 데이터 |
@@ -236,7 +262,7 @@ RecieptVision-KW/
 python receipt_pipeline.py images/receipt_01.jpg
 ```
 
-기본적으로 Dynamic Adaptive Threshold가 적용되며 결과는 다음 경로에 저장됩니다.
+기본적으로 V5.4 Hybrid 전처리가 적용되며 결과는 다음 경로에 저장됩니다.
 
 ```text
 outputs/receipt_result.json
@@ -262,6 +288,8 @@ python receipt_pipeline.py images/receipt_01.jpg --method clahe_gaussian_b21_c10
 
 | Method | Description |
 |---|---|
+| hybrid | 너비 기반 CLAHE / Dynamic 자동 선택 (기본값) |
+| clahe | Grayscale 및 CLAHE (이진화 없음) |
 | dynamic | 이미지 너비 기반 동적 Block Size |
 | grayscale | Grayscale 이미지 |
 | baseline_adaptive | 기본 Adaptive Threshold |
@@ -294,7 +322,7 @@ from preprocessing import preprocess_receipt, save_image
 
 result = preprocess_receipt(
     "images/receipt_01.jpg",
-    method="dynamic"
+    method="hybrid"
 )
 
 if result["success"]:
@@ -302,6 +330,7 @@ if result["success"]:
     save_image("ocr_ready.png", result["ocr_image"])
 
     print("Method:", result["method"])
+    print("Selected Method:", result["selected_method"])
     print("Actual Method:", result["actual_method"])
     print("Block Size:", result["block_size"])
 else:
@@ -327,7 +356,7 @@ python batch_test.py --images images --output outputs/batch_test --method dynami
 - warped.png: 원근 보정 이미지
 - ocr_ready.png: OCR 입력용 전처리 이미지
 - detection_overlay.png: 영수증 검출 결과 시각화
-- test_results.csv: 전체 이미지 처리 결과 및 검출 정보
+- test_results.csv: 전체 이미지 처리 결과, 검출 정보, 선택 방식, 버전, 상하단 확장 여부, 면적 비율 및 너비 기준
 
 ### 6.8 Preprocessing Example
 
@@ -337,7 +366,7 @@ python batch_test.py --images images --output outputs/batch_test --method dynami
 python receiptvision_example.py images/receipt_01.jpg
 ```
 
-기본적으로 Dynamic Adaptive Threshold가 적용되며, 결과는 `outputs/ocr_handoff/`에 저장됩니다.
+기본적으로 V5.4 Hybrid 전처리가 적용되며, 결과는 `outputs/ocr_handoff/`에 저장됩니다.
 
 
 ## 7. Output Format
@@ -358,9 +387,22 @@ python receiptvision_example.py images/receipt_01.jpg
 {
   "success": true,
   "preprocessing": {
-    "method": "dynamic",
-    "actual_method": "clahe_gaussian_b41_c10",
-    "block_size": 41
+    "method": "hybrid",
+    "selected_method": "clahe",
+    "actual_method": "clahe",
+    "preprocessing_version": "V5.4",
+    "block_size": null,
+    "hybrid_selection": {
+      "enabled": true,
+      "warped_width": 258,
+      "warped_height": 412,
+      "width_threshold": 600,
+      "selected_method": "clahe"
+    },
+    "boundary_extension": {
+      "top_extended": false,
+      "bottom_extended": false
+    }
   },
   "receipt": {
     "merchant": "EXAMPLE STORE",
@@ -421,7 +463,7 @@ Dynamic 방식 적용 후 대상 문자열 일치율이 약 44.44%p 개선되었
 
 Target Token Match는 사전에 정의한 문자열의 OCR 결과 내 포함 여부를 평가한 지표이며, 전체 문자 인식 정확도나 구조화된 정보 추출 정확도를 의미하지 않습니다.
 
-### 8.3 Clean Environment Integration Test
+### 8.3 Clean Environment Integration Test (V5.2)
 
 기존 개발 환경과 분리된 신규 Python 가상환경을 생성하고 `requirements.txt`를 기반으로 라이브러리를 설치하여 전체 파이프라인을 검증했습니다.
 
@@ -442,7 +484,7 @@ Target Token Match는 사전에 정의한 문자열의 OCR 결과 내 포함 여
 
 PASS는 전체 파이프라인이 오류 없이 실행되었음을 의미하며, 모든 영수증 정보가 정확하게 추출되었음을 의미하지 않습니다.
 
-### 8.4 Information Extraction Results
+### 8.4 Information Extraction Results (V5.2)
 
 전체 테스트 이미지 7개에 대한 정보 반환 및 내부 검증 결과입니다.
 
@@ -455,6 +497,23 @@ PASS는 전체 파이프라인이 오류 없이 실행되었음을 의미하며,
 | Total Mismatch | 3 / 7 |
 
 정보 반환 여부 및 내부 금액 일치 여부는 실제 정답 데이터와의 정확도 평가와 구분됩니다.
+
+### 8.5 Automatic Boundary Extension (V5.3)
+
+기존 7장에서는 V5.2와 OCR 입력 픽셀이 동일했고, 추가 영수증 1장에서는 상하단 확장이 적용되었습니다. 해당 이미지의 원근 보정 크기는 519 × 861px에서 538 × 1362px로 변경되었으며, 경계 사각형 면적은 약 1.6007배가 되었습니다.
+
+### 8.6 Hybrid Preprocessing Evaluation (V5.4)
+
+V5.3 경계 확장을 공통 적용한 영수증 8장에 Dynamic, Grayscale, CLAHE를 각각 적용하여 총 24회 OCR 비교 실험을 수행했습니다. 이후 너비 기반 Hybrid를 검증했습니다.
+
+| Metric | Dynamic | Grayscale | CLAHE | Hybrid |
+|---|---:|---:|---:|---:|
+| Total and Currency Correct | 4/8 | 7/8 | 7/8 | 7/8 |
+| Accuracy | 50.0% | 87.5% | 87.5% | 87.5% |
+| Domestic Accuracy | 4/7 | 7/7 | 7/7 | 7/7 |
+| Mean OCR Confidence | 0.5449 | 0.7302 | 0.7539 | 0.7468 |
+
+Hybrid는 CLAHE 6장, Dynamic 2장을 선택했습니다. Dynamic 대비 결제금액·통화 정확도가 37.5%p 증가했으며 오류 건수는 4건에서 1건으로 감소했습니다. CLAHE 단독보다 높은 정확도를 보인 것은 아닙니다. Confidence는 OCR 엔진의 신뢰도이며 정답 정확도와 다릅니다. 평가에 사용한 8장은 기준 선정에도 사용했으므로 독립적인 일반화 검증이 아닙니다.
 
 ## 9. Testing
 
@@ -475,7 +534,7 @@ python -m unittest test_information_extractor test_receipt_regression test_ocr_v
 | test_ocr_variant_consensus | 5 / 5 |
 | Total | 19 / 19 |
 
-신규 가상환경에서도 동일하게 19개 테스트가 모두 통과했습니다.
+신규 가상환경 및 V5.4 통합 이후에도 19개 테스트가 모두 통과했습니다.
 
 ### 9.2 Dependency Validation
 
@@ -488,7 +547,7 @@ python -m pip check
 
 ### 9.3 Batch Preprocessing Test
 
-최신 V5.2 전처리 API를 기반으로 일괄 처리 기능을 검증했습니다.
+V5.2 전처리 API를 기반으로 수행한 기존 일괄 처리 검증 결과입니다.
 
 | Metric | Result |
 |---|---:|
@@ -504,6 +563,22 @@ python -m pip check
 처리 성공률은 영수증 검출 및 전처리 과정의 실행 성공 여부를 나타내며, 검출 정확도나 OCR 인식 정확도와는 구분됩니다.
 
 
+### 9.4 V5.4 Integration Regression
+
+통합 이전에 저장한 V5.4 실험 결과와 통합 모듈의 결과를 비교했습니다.
+
+| Metric | Result |
+|---|---:|
+| Execution success | 8/8 |
+| Method selection equality | 8/8 |
+| Warped image pixel equality | 8/8 |
+| OCR input pixel equality | 8/8 |
+| Structured receipt equality | 8/8 |
+| Preprocessing method execution compatibility | 8/8 |
+| Regression errors | 0 |
+
+회귀 테스트는 기존 결과의 재현성을 확인하며 기존 추출 오류까지 해결되었음을 의미하지 않습니다. 실제 영수증 및 로컬 실험 결과에 의존한 테스트이므로 저장소의 기본 단위 테스트와 구분합니다.
+
 ## 10. Known Issues
 
 현재 프로젝트는 영수증 이미지 기반 OCR 및 정보 추출 프로토타입이며 다음과 같은 한계가 존재합니다.
@@ -513,7 +588,8 @@ python -m pip check
 - 승인번호, 매장 정보 등의 숫자가 상품 금액으로 잘못 추출될 수 있습니다.
 - 일부 영수증에서 상품 합계와 실제 총금액이 일치하지 않을 수 있습니다.
 - 상호명 또는 날짜가 추출되지 않을 경우 null이 반환될 수 있습니다.
-- 현재 정보 추출 로직은 한국어 영수증 및 KRW 중심으로 구성되어 있습니다.
+- 현재 정보 추출 로직은 한국어 영수증 및 KRW 중심으로 구성되어 있습니다. 해외 영수증 1장에서는 금액과 통화 모두 잘못 추출되었습니다.
+- V5.3 경계 확장 및 V5.4의 600px 기준은 제한된 데이터에서 검증되었으며 신규 독립 데이터 검증이 필요합니다.
 - 복수 OCR 결과 병합 기능은 기본 통합 파이프라인에 자동 적용되지 않습니다.
 - 일부 이전 버전의 실험 스크립트는 최신 전처리 API와 호환되지 않을 수 있습니다.
 - 다른 운영체제 및 EasyOCR 모델의 최초 다운로드 환경은 별도로 검증하지 않았습니다.
@@ -527,7 +603,7 @@ python -m pip check
 
 | Member | Role | Contributions |
 |---|---|---|
-| 전예찬 (Junyechan) | Team Leader / Image Preprocessing | 영수증 검출, 모서리 추정, 원근 보정, 이미지 전처리, V5.2 Dynamic Adaptive Threshold, 전체 파이프라인 통합 및 검증 |
+| 전예찬 (Junyechan) | Team Leader / Image Preprocessing | 영수증 검출, 모서리 추정, 원근 보정, 이미지 전처리, V5.2 Dynamic Adaptive Threshold, V5.3 자동 경계 확장, V5.4 Hybrid 전처리, 전체 파이프라인 통합 및 검증 |
 | 제이란 바리시잔 (sanzican) | OCR / Information Extraction | EasyOCR 연동, OCR 결과 분석, 영수증 정보 추출, 금액 검증, 복수 OCR 결과 병합 및 회귀 테스트 |
 
 ## 12. Technologies

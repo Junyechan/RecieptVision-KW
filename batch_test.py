@@ -1,5 +1,5 @@
 
-"""Batch preprocessing test for ReceiptVision V5.2."""
+"""Batch preprocessing test for ReceiptVision V5.4."""
 
 from pathlib import Path
 import argparse
@@ -37,10 +37,16 @@ FIELDNAMES = [
     "detection_source",
     "valid_ocr_image",
     "error",
+    "selected_method",
+    "preprocessing_version",
+    "top_extended",
+    "bottom_extended",
+    "area_ratio",
+    "width_threshold",
 ]
 
 
-def batch_test(image_dir, output_dir, method="dynamic"):
+def batch_test(image_dir, output_dir, method="hybrid"):
     image_dir = Path(image_dir)
     output_dir = Path(output_dir)
 
@@ -102,7 +108,16 @@ def batch_test(image_dir, output_dir, method="dynamic"):
             warped = result["warped"]
             ocr_image = result["ocr_image"]
 
+            extension = result["boundary_extension"]
+            selection = result["hybrid_selection"]
+
             record.update({
+                "selected_method": result["selected_method"],
+                "preprocessing_version": result["preprocessing_version"],
+                "top_extended": extension["top_extended"],
+                "bottom_extended": extension["bottom_extended"],
+                "area_ratio": extension["area_ratio"],
+                "width_threshold": selection["width_threshold"],
                 "receipt_detected": True,
                 "warped_height": warped.shape[0],
                 "warped_width": warped.shape[1],
@@ -150,6 +165,8 @@ def batch_test(image_dir, output_dir, method="dynamic"):
             print("영수증 검출: True")
             print("OCR 이미지 유효:", valid_ocr_image)
             print("전처리 방식:", result["actual_method"])
+            print("선택 방식:", result["selected_method"])
+            print("상단/하단 확장:", extension["top_extended"], extension["bottom_extended"])
             print("Block Size:", result["block_size"])
             print("Result: PASS")
 
@@ -233,8 +250,8 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--method",
-        default="dynamic",
-        help="Preprocessing method",
+        default="hybrid",
+        help="Preprocessing method (default: hybrid)",
     )
 
     args = parser.parse_args()

@@ -1,5 +1,5 @@
 
-"""ReceiptVision V5.2 preprocessing example."""
+"""ReceiptVision V5.4 preprocessing example."""
 
 from pathlib import Path
 import argparse
@@ -22,8 +22,8 @@ def main():
 
     parser.add_argument(
         "--method",
-        default="dynamic",
-        help="Preprocessing method",
+        default="hybrid",
+        help="Preprocessing method (default: hybrid)",
     )
 
     args = parser.parse_args()
@@ -59,6 +59,14 @@ def main():
     )
 
     print("Corners:", result["corners"])
+    print("OCR corners:", result["ocr_corners"])
+    print("Version:", result["preprocessing_version"])
+    print("Selected method:", result["selected_method"])
+    print("Hybrid selection:", result["hybrid_selection"])
+    extension = result["boundary_extension"]
+    print("Top extended:", extension["top_extended"])
+    print("Bottom extended:", extension["bottom_extended"])
+    print("Area ratio:", extension["area_ratio"])
     print("Method:", result["method"])
     print("Actual method:", result["actual_method"])
     print("Block size:", result["block_size"])
