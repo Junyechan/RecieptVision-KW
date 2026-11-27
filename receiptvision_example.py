@@ -1,21 +1,70 @@
-"""OCR 담당 팀원용: 전처리 모듈의 최소 사용 예제."""
+
+"""ReceiptVision V5.2 preprocessing example."""
+
 from pathlib import Path
+import argparse
+
 from preprocessing import preprocess_receipt, save_image
 
-image_path = Path('images/receipt_01.jpg')
-result = preprocess_receipt(image_path, method='clahe_gaussian_b21_c10')
-if not result['success']:
-    raise RuntimeError(f"영수증 전처리 실패: {result['error']}")
 
-out = Path('outputs/ocr_handoff')
-out.mkdir(parents=True, exist_ok=True)
-save_image(out / 'warped.png', result['warped'])
-save_image(out / 'ocr_ready.png', result['ocr_image'])
-save_image(out / 'detection_overlay.png', result['detection_overlay'])
+def main():
 
-# OCR 담당자는 result['ocr_image'] (numpy uint8, 2D)를 OCR 엔진에 전달하면 됩니다.
-# 원본 컬러 영수증이 필요하면 result['warped'] (numpy uint8, HxWx3)를 사용하세요.
-print('corners:', result['corners'])
-print('method:', result['method'])
-print('ocr_image shape:', result['ocr_image'].shape)
-print('saved:', out)
+    parser = argparse.ArgumentParser(
+        description="Receipt preprocessing example"
+    )
+
+    parser.add_argument(
+        "image",
+        nargs="?",
+        default="images/receipt_01.jpg",
+        help="Input receipt image",
+    )
+
+    parser.add_argument(
+        "--method",
+        default="dynamic",
+        help="Preprocessing method",
+    )
+
+    args = parser.parse_args()
+
+    image_path = Path(args.image)
+
+    result = preprocess_receipt(
+        image_path,
+        method=args.method,
+    )
+
+    if not result["success"]:
+        raise RuntimeError(
+            f"영수증 전처리 실패: {result['error']}"
+        )
+
+    out = Path("outputs/ocr_handoff")
+    out.mkdir(parents=True, exist_ok=True)
+
+    save_image(
+        out / "warped.png",
+        result["warped"],
+    )
+
+    save_image(
+        out / "ocr_ready.png",
+        result["ocr_image"],
+    )
+
+    save_image(
+        out / "detection_overlay.png",
+        result["detection_overlay"],
+    )
+
+    print("Corners:", result["corners"])
+    print("Method:", result["method"])
+    print("Actual method:", result["actual_method"])
+    print("Block size:", result["block_size"])
+    print("OCR image shape:", result["ocr_image"].shape)
+    print("Saved:", out)
+
+
+if __name__ == "__main__":
+    main()
