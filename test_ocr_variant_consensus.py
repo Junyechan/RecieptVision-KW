@@ -8,7 +8,7 @@ from pathlib import Path
 from information_extractor import extract_receipt_info, _merge_ocr_variant_lines
 
 BASE = Path(__file__).resolve().parent
-FIXTURE = BASE / "outputs" / "items_ocr" / "items_ocr_comparison.json"
+FIXTURE = BASE / "tests" / "fixtures" / "items_ocr_comparison.json"
 
 
 class OCRVariantConsensusTests(unittest.TestCase):

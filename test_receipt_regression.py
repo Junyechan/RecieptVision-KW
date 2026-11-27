@@ -8,8 +8,8 @@ BASE = Path(__file__).resolve().parent
 class ReceiptRegressionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.full = json.loads((BASE / "outputs" / "clear_korean_receipt_final.json").read_text(encoding="utf-8"))
-        cls.crop = json.loads((BASE / "outputs" / "items_ocr" / "items_ocr_comparison.json").read_text(encoding="utf-8"))
+        cls.full = json.loads((BASE / "tests" / "fixtures" / "clear_korean_receipt_final.json").read_text(encoding="utf-8"))
+        cls.crop = json.loads((BASE / "tests" / "fixtures" / "items_ocr_comparison.json").read_text(encoding="utf-8"))
         ocr = dict(cls.full["ocr"])
         ocr["item_table_ocr"] = cls.crop
         cls.result = extract_receipt_info(ocr)
