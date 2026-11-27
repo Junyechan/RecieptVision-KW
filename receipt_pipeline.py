@@ -13,7 +13,7 @@ from information_extractor import extract_receipt_info
 
 def process_receipt(
     image_path: str | Path,
-    method: str = "dynamic",
+    method: str = "hybrid",
     languages: tuple[str, ...] = ("ko", "en"),
     output_json: str | Path | None = None,
 ) -> dict[str, Any]:
@@ -39,6 +39,10 @@ def process_receipt(
         "preprocessing": {
             "method": prep["method"],
             "actual_method": prep["actual_method"],
+            "selected_method": prep["selected_method"],
+            "preprocessing_version": prep["preprocessing_version"],
+            "hybrid_selection": prep["hybrid_selection"],
+            "boundary_extension": prep["boundary_extension"],
             "block_size": prep["block_size"],
             "detection_score": prep["detection_score"],
             "detection_source": prep["detection_source"],
@@ -79,8 +83,8 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--method",
-        default="dynamic",
-        help="Preprocessing variant (default: dynamic)",
+        default="hybrid",
+        help="Preprocessing variant (default: hybrid)",
     )
 
     args = parser.parse_args()
