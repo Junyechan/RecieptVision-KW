@@ -55,6 +55,14 @@ def warp_receipt(image,corners):
 
 four_point_transform=warp_receipt
 
+def get_dynamic_block_size(width):
+    """Scale the adaptive threshold window with warped receipt width."""
+    block = max(21, min(81, int(21 * width / 800)))
+    if block % 2 == 0:
+        block += 1
+    return block
+
+
 def make_ocr_variants(warped):
     gray=cv2.cvtColor(warped,cv2.COLOR_BGR2GRAY)
     clahe=cv2.createCLAHE(clipLimit=2.0,tileGridSize=(8,8)).apply(gray)
@@ -64,7 +72,9 @@ def make_ocr_variants(warped):
         return cv2.adaptiveThreshold(im,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY,block,10)
     return {'grayscale':gray,'baseline_adaptive':adapt(gb,31),
             'clahe_gaussian_b21_c10':adapt(cb,21),
-            'clahe_gaussian_b31_c10':adapt(cb,31)}
+            'clahe_gaussian_b31_c10':adapt(cb,31),
+            'clahe_gaussian_b41_c10':adapt(cb,41),
+            'dynamic':adapt(cb,get_dynamic_block_size(warped.shape[1]))}
 
 def draw_detection(image,corners):
     result=image.copy();pts=np.rint(corners).astype(np.int32)
@@ -205,7 +215,7 @@ def make_ocr_safe_corners(corners, image_shape, correction_reason):
     return order_points(corners)
 
 
-def preprocess_receipt(image_input,method='clahe_gaussian_b21_c10'):
+def preprocess_receipt(image_input,method='dynamic'):
     try:
         image=read_image(image_input) if isinstance(image_input,(str,Path)) else image_input.copy()
         if image.ndim!=3 or image.shape[2]!=3:raise ValueError('BGR 이미지 필요')
@@ -216,15 +226,25 @@ def preprocess_receipt(image_input,method='clahe_gaussian_b21_c10'):
         warped=warp_receipt(image,ocr_corners)
         variants=make_ocr_variants(warped)
         if method not in variants:raise ValueError('지원하지 않는 OCR 전처리: '+method)
+        block_size = {
+            'grayscale': None, 'baseline_adaptive': 31,
+            'clahe_gaussian_b21_c10': 21, 'clahe_gaussian_b31_c10': 31,
+            'clahe_gaussian_b41_c10': 41,
+            'dynamic': get_dynamic_block_size(warped.shape[1])
+        }[method]
+        actual_method = (f'clahe_gaussian_b{block_size}_c10'
+                         if method == 'dynamic' else method)
         return {'success':True,'error':None,'corners':corners.tolist(),
                 'ocr_corners':ocr_corners.tolist(),
                 'detection_score':result['score'],'detection_source':result['source'],
                 'candidate_count':result['candidate_count'],'top_candidates':result['top_candidates'],
                 'warped':warped,'ocr_image':variants[method],'variants':variants,
                 'detection_overlay':draw_detection(image,corners),'method':method,
+                'actual_method':actual_method,
+                'block_size':block_size,'preprocessing_mode':method,
                 'top_correction':result['top_correction']}
     except (ValueError,TypeError,OSError,cv2.error) as exc:
         return {'success':False,'error':str(exc),'corners':None,'detection_score':None,
                 'detection_source':None,'ocr_corners':None,'candidate_count':0,'top_candidates':[],
                 'warped':None,'ocr_image':None,'variants':{},'detection_overlay':None,
-                'method':method,'top_correction':None}
+                'method':method,'actual_method':None,'top_correction':None,'block_size':None,'preprocessing_mode':method}
