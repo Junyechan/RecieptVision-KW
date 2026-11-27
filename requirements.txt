@@ -1,2 +1,3 @@
 easyocr==1.7.2
-opencv-python-headless==5.0.0.93
+opencv-python-headless==5.1.0.95
+numpy==2.5.4

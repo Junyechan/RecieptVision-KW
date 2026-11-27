@@ -1,156 +1,249 @@
 
+"""Batch preprocessing test for ReceiptVision V5.2."""
+
 from pathlib import Path
+import argparse
 import csv
 import numpy as np
 
 from preprocessing import (
-    BASE_DIR,
     preprocess_receipt,
-    save_results
+    read_image,
+    save_image,
 )
 
-# 경로 설정
-IMAGE_DIR = BASE_DIR / "images"
-OUTPUT_DIR = BASE_DIR / "outputs" / "batch_test"
 
-# 지원 이미지 형식
-EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp"}
+BASE_DIR = Path(__file__).resolve().parent
 
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+EXTENSIONS = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".bmp",
+}
 
-# 테스트할 이미지 검색
-image_files = sorted(
-    path for path in IMAGE_DIR.iterdir()
-    if path.is_file()
-    and path.suffix.lower() in EXTENSIONS
-)
+FIELDNAMES = [
+    "filename",
+    "status",
+    "receipt_detected",
+    "original_height",
+    "original_width",
+    "warped_height",
+    "warped_width",
+    "method",
+    "actual_method",
+    "block_size",
+    "detection_score",
+    "detection_source",
+    "valid_ocr_image",
+    "error",
+]
 
-if not image_files:
-    raise FileNotFoundError(
-        "images 폴더에 테스트 이미지가 없습니다."
-    )
 
-records = []
+def batch_test(image_dir, output_dir, method="dynamic"):
+    image_dir = Path(image_dir)
+    output_dir = Path(output_dir)
 
-print(f"테스트 이미지 수: {len(image_files)}")
-
-for index, image_path in enumerate(image_files, start=1):
-    print(
-        f"\n[{index}/{len(image_files)}] "
-        f"{image_path.name}"
-    )
-
-    try:
-        # 전처리 실행
-        results = preprocess_receipt(image_path)
-
-        # 이미지별 결과 폴더
-        result_dir = OUTPUT_DIR / image_path.stem
-
-        # 결과 저장
-        save_results(results, result_dir)
-
-        # 영수증 검출 여부
-        detected = results["receipt_detected"]
-
-        # 이미지 크기
-        original_shape = results["original"].shape
-        warped_shape = results["warped"].shape
-
-        # OCR용 이미지 유효성 검사
-        ocr_image = results["warped_otsu"]
-
-        valid_ocr_image = (
-            isinstance(ocr_image, np.ndarray)
-            and ocr_image.ndim == 2
-            and ocr_image.dtype == np.uint8
-            and ocr_image.size > 0
+    if not image_dir.is_dir():
+        raise FileNotFoundError(
+            f"이미지 폴더가 없습니다: {image_dir}"
         )
 
-        records.append({
-            "filename": image_path.name,
-            "status": "success",
-            "receipt_detected": detected,
-            "original_height": original_shape[0],
-            "original_width": original_shape[1],
-            "warped_height": warped_shape[0],
-            "warped_width": warped_shape[1],
-            "valid_ocr_image": valid_ocr_image,
-            "error": ""
-        })
+    image_files = sorted(
+        path for path in image_dir.iterdir()
+        if path.is_file()
+        and path.suffix.lower() in EXTENSIONS
+    )
 
-        print("영수증 검출:", detected)
-        print("OCR 이미지 유효:", valid_ocr_image)
+    if not image_files:
+        raise FileNotFoundError(
+            "테스트 이미지가 없습니다."
+        )
 
-    except Exception as e:
-        records.append({
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    records = []
+
+    print(f"테스트 이미지 수: {len(image_files)}")
+
+    for index, image_path in enumerate(image_files, start=1):
+
+        print(
+            f"\n[{index}/{len(image_files)}] "
+            f"{image_path.name}"
+        )
+
+        record = {
+            key: "" for key in FIELDNAMES
+        }
+
+        record.update({
             "filename": image_path.name,
             "status": "error",
             "receipt_detected": False,
-            "original_height": "",
-            "original_width": "",
-            "warped_height": "",
-            "warped_width": "",
             "valid_ocr_image": False,
-            "error": str(e)
+            "method": method,
         })
 
-        print("오류:", e)
+        try:
+            original = read_image(image_path)
 
-# CSV 결과 저장
-csv_path = OUTPUT_DIR / "test_results.csv"
+            record["original_height"] = original.shape[0]
+            record["original_width"] = original.shape[1]
 
-with open(
-    csv_path,
-    "w",
-    newline="",
-    encoding="utf-8-sig"
-) as file:
-    writer = csv.DictWriter(
-        file,
-        fieldnames=[
-            "filename",
-            "status",
-            "receipt_detected",
-            "original_height",
-            "original_width",
-            "warped_height",
-            "warped_width",
-            "valid_ocr_image",
-            "error"
-        ]
+            result = preprocess_receipt(
+                original,
+                method=method,
+            )
+
+            if not result["success"]:
+                raise RuntimeError(result["error"])
+
+            warped = result["warped"]
+            ocr_image = result["ocr_image"]
+
+            record.update({
+                "receipt_detected": True,
+                "warped_height": warped.shape[0],
+                "warped_width": warped.shape[1],
+                "method": result["method"],
+                "actual_method": result["actual_method"],
+                "block_size": result["block_size"],
+                "detection_score": result["detection_score"],
+                "detection_source": result["detection_source"],
+            })
+
+            valid_ocr_image = (
+                isinstance(ocr_image, np.ndarray)
+                and ocr_image.ndim == 2
+                and ocr_image.dtype == np.uint8
+                and ocr_image.size > 0
+            )
+
+            record["valid_ocr_image"] = valid_ocr_image
+
+            if not valid_ocr_image:
+                raise RuntimeError(
+                    "유효하지 않은 OCR 입력 이미지"
+                )
+
+            result_dir = output_dir / image_path.stem
+            result_dir.mkdir(parents=True, exist_ok=True)
+
+            save_image(
+                result_dir / "warped.png",
+                warped,
+            )
+
+            save_image(
+                result_dir / "ocr_ready.png",
+                ocr_image,
+            )
+
+            save_image(
+                result_dir / "detection_overlay.png",
+                result["detection_overlay"],
+            )
+
+            record["status"] = "success"
+
+            print("영수증 검출: True")
+            print("OCR 이미지 유효:", valid_ocr_image)
+            print("전처리 방식:", result["actual_method"])
+            print("Block Size:", result["block_size"])
+            print("Result: PASS")
+
+        except Exception as exc:
+            record["error"] = str(exc)
+
+            print("Result: FAIL")
+            print("오류:", exc)
+
+        records.append(record)
+
+    csv_path = output_dir / "test_results.csv"
+
+    with csv_path.open(
+        "w",
+        newline="",
+        encoding="utf-8-sig",
+    ) as file:
+
+        writer = csv.DictWriter(
+            file,
+            fieldnames=FIELDNAMES,
+        )
+
+        writer.writeheader()
+        writer.writerows(records)
+
+    total = len(records)
+
+    detected_count = sum(
+        r["receipt_detected"]
+        for r in records
     )
 
-    writer.writeheader()
-    writer.writerows(records)
+    valid_count = sum(
+        r["valid_ocr_image"]
+        for r in records
+    )
 
-# 결과 통계
-total = len(records)
+    success_count = sum(
+        r["status"] == "success"
+        for r in records
+    )
 
-detected_count = sum(
-    record["receipt_detected"]
-    for record in records
-)
+    print("\n========== 테스트 결과 ==========")
+    print("전체 이미지:", total)
+    print("영수증 후보 검출:", detected_count)
+    print("OCR 이미지 형식 정상:", valid_count)
+    print("처리 성공:", success_count)
+    print("처리 오류:", total - success_count)
 
-valid_count = sum(
-    record["valid_ocr_image"]
-    for record in records
-)
+    print(
+        "처리 성공률:",
+        f"{success_count / total * 100:.1f}%"
+    )
 
-error_count = sum(
-    record["status"] == "error"
-    for record in records
-)
+    print("CSV 저장:", csv_path)
 
-print("\n========== 테스트 결과 ==========")
-print("전체 이미지:", total)
-print("영수증 후보 검출:", detected_count)
-print("OCR 이미지 형식 정상:", valid_count)
-print("처리 오류:", error_count)
+    return records
 
-print(
-    "후보 검출 비율:",
-    f"{detected_count / total * 100:.1f}%"
-)
 
-print("CSV 저장:", csv_path)
+if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser(
+        description="Batch receipt preprocessing test"
+    )
+
+    parser.add_argument(
+        "--images",
+        type=Path,
+        default=BASE_DIR / "images",
+        help="Input image directory",
+    )
+
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=BASE_DIR / "outputs" / "batch_test",
+        help="Output directory",
+    )
+
+    parser.add_argument(
+        "--method",
+        default="dynamic",
+        help="Preprocessing method",
+    )
+
+    args = parser.parse_args()
+
+    records = batch_test(
+        args.images,
+        args.output,
+        args.method,
+    )
+
+    if any(r["status"] != "success" for r in records):
+        raise SystemExit(1)
