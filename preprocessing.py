@@ -239,11 +239,12 @@ def preprocess_receipt(image_input,method='dynamic'):
                 'detection_score':result['score'],'detection_source':result['source'],
                 'candidate_count':result['candidate_count'],'top_candidates':result['top_candidates'],
                 'warped':warped,'ocr_image':variants[method],'variants':variants,
-                'detection_overlay':draw_detection(image,corners),'method':actual_method,
+                'detection_overlay':draw_detection(image,corners),'method':method,
+                'actual_method':actual_method,
                 'block_size':block_size,'preprocessing_mode':method,
                 'top_correction':result['top_correction']}
     except (ValueError,TypeError,OSError,cv2.error) as exc:
         return {'success':False,'error':str(exc),'corners':None,'detection_score':None,
                 'detection_source':None,'ocr_corners':None,'candidate_count':0,'top_candidates':[],
                 'warped':None,'ocr_image':None,'variants':{},'detection_overlay':None,
-                'method':method,'top_correction':None,'block_size':None,'preprocessing_mode':method}
+                'method':method,'actual_method':None,'top_correction':None,'block_size':None,'preprocessing_mode':method}
